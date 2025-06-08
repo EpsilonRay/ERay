@@ -8,8 +8,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +122,27 @@ func (x *CoreController) StartLoop(configContent string) (err error) {
 	return x.doStartLoop(configContent)
 }
 
+// StartLoopVless parse, make config and initializes and starts the core processing loop
+// Thread-safe method that configures and runs the Xray core with the provided configuration
+// Returns immediately if the core is already running
+func (x *CoreController) StartLoopVless(vlessLink string) (err error) {
+	x.coreMutex.Lock()
+	defer x.coreMutex.Unlock()
+
+	if x.IsRunning {
+		log.Println("Core is already running")
+		return nil
+	}
+
+	configContent, err := ParseVLESSUrlToConfig(vlessLink)
+	if err != nil {
+		println("invalid VLESS link: %w", err)
+		return fmt.Errorf("invalid VLESS link: %w", err)
+	}
+
+	return x.doStartLoop(configContent)
+}
+
 // StopLoop safely stops the core processing loop and releases resources
 // Thread-safe method that shuts down the core instance and triggers necessary callbacks
 func (x *CoreController) StopLoop() error {
@@ -190,8 +213,8 @@ func MeasureOutboundDelay(ConfigureFileContent string, url string) (int64, error
 
 // CheckVersionX returns the library and Xray versions
 func (x *CoreController) CheckVersionX() string {
-	var versionEpsilonCore = "1.0.5"
-	return fmt.Sprintf("EC v%d, Xray-core v%s", versionEpsilonCore, core.Version())
+	var version = "1.0.5"
+	return fmt.Sprintf("ERay v%s, Xray-core v%s", version, core.Version())
 }
 
 // doShutdown shuts down the Xray instance and cleans up resources
@@ -292,4 +315,73 @@ func createStdoutLogWriter() corecommlog.WriterCreator {
 			logger: log.New(os.Stdout, "", 0),
 		}
 	}
+}
+
+// ParseVLESSUrlToConfig parses a VLESS URL and returns a JSON config string.
+func ParseVLESSUrlToConfig(rawurl string) (string, error) {
+	regex := regexp.MustCompile(`(?i)^vless://([a-f0-9\-]+)@([\w\.-]+):(\d+)\?([^#]*)#?(.*)?$`)
+	matches := regex.FindStringSubmatch(rawurl)
+	if len(matches) < 5 {
+		return "", fmt.Errorf("invalid VLESS URL")
+	}
+
+	uuid := matches[1]
+	address := matches[2]
+	port := matches[3]
+	rawQuery := matches[4]
+
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse query: %w", err)
+	}
+
+	// extract query parameters
+	networkType := values.Get("type")
+	if networkType == "" {
+		networkType = "tcp"
+	}
+	security := values.Get("security")
+	if security == "" {
+		security = "none"
+	}
+
+	// build JSON config
+	config := fmt.Sprintf(`{
+		"inbounds": [
+			{
+			"port": 10808,
+			"listen": "127.0.0.1",
+			"protocol": "socks",
+			"settings": {
+				"auth": "noauth",
+				"udp": true
+			}
+			}
+		],
+		"outbounds": [
+			{
+			"protocol": "vless",
+			"settings": {
+				"vnext": [
+				{
+					"address": "%s",
+					"port": %s,
+					"users": [
+					{
+						"id": "%s",
+						"encryption": "%s"
+					}
+					]
+				}
+				]
+			},
+			"streamSettings": {
+				"network": "%s",
+				"security": "%s"
+			}
+			}
+		]
+		}`, address, port, uuid, security, networkType, security)
+
+	return config, nil
 }
